@@ -1521,6 +1521,35 @@ impl RequestForwarder {
             mapped_body
         };
 
+        // Clamp reasoning.effort for models with restricted effort domains
+        // on the native Responses passthrough path (e.g. qwen3.8-max: no "high").
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            let needs_qwen_clamp = request_body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.to_lowercase().starts_with("qwen3.8-max"));
+            if needs_qwen_clamp {
+                let effort_owned = request_body
+                    .pointer("/reasoning/effort")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(effort) = effort_owned {
+                    // qwen3.8-max only accepts low / medium / xhigh
+                    let clamped = match effort.as_str() {
+                        "low" => "low",
+                        "medium" => "medium",
+                        _ => "xhigh",
+                    };
+                    if clamped != effort {
+                        request_body["reasoning"]["effort"] = serde_json::json!(clamped);
+                    }
+                }
+            }
+        }
+
         // Native Responses passthrough to a strict third-party gateway (xAI):
         // flatten Codex's private `namespace`/plugin tool declarations into
         // top-level function tools so the upstream's strict serde parser does

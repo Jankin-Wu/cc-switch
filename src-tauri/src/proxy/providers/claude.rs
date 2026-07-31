@@ -455,7 +455,22 @@ pub fn transform_claude_request_for_api_format(
             Some(&provider.id),
             session_id,
         ),
-        _ => Ok(body),
+        _ => {
+            // For qwen3.8-max on Anthropic-format upstreams, inject reasoning_effort
+            // derived from thinking/output_config since the gateway expects it.
+            let mut body = body;
+            if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
+                if super::transform::supports_reasoning_effort(model) {
+                    if let Some(effort) = super::transform::resolve_reasoning_effort(&body) {
+                        let effort =
+                            super::transform::clamp_reasoning_effort_for_model(model, effort);
+                        body["reasoning_effort"] = json!(effort);
+                        body["enable_thinking"] = json!(true);
+                    }
+                }
+            }
+            Ok(body)
+        }
     }
 }
 
@@ -2677,5 +2692,76 @@ mod tests {
         assert!(changed);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("output_config").is_none());
+    }
+
+    // ==================== qwen3.8-max Anthropic passthrough ====================
+
+    #[test]
+    fn test_anthropic_passthrough_qwen_injects_reasoning_effort() {
+        let provider = create_provider(json!({}));
+        let body = json!({
+            "model": "qwen3.8-max-preview",
+            "thinking": { "type": "enabled", "budget_tokens": 16000 },
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let result =
+            transform_claude_request_for_api_format(body, &provider, "anthropic", None, None)
+                .unwrap();
+        // budget_tokens >= 16000 → high → clamped to xhigh for qwen3.8-max
+        assert_eq!(result["reasoning_effort"], "xhigh");
+        assert_eq!(result["enable_thinking"], true);
+    }
+
+    #[test]
+    fn test_anthropic_passthrough_qwen_output_config() {
+        let provider = create_provider(json!({}));
+        let body = json!({
+            "model": "qwen3.8-max-preview",
+            "output_config": { "effort": "high" },
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let result =
+            transform_claude_request_for_api_format(body, &provider, "anthropic", None, None)
+                .unwrap();
+        // high → clamped to xhigh for qwen3.8-max
+        assert_eq!(result["reasoning_effort"], "xhigh");
+        assert_eq!(result["enable_thinking"], true);
+    }
+
+    #[test]
+    fn test_anthropic_passthrough_qwen_low_effort() {
+        let provider = create_provider(json!({}));
+        let body = json!({
+            "model": "qwen3.8-max",
+            "output_config": { "effort": "low" },
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let result =
+            transform_claude_request_for_api_format(body, &provider, "anthropic", None, None)
+                .unwrap();
+        assert_eq!(result["reasoning_effort"], "low");
+        assert_eq!(result["enable_thinking"], true);
+    }
+
+    #[test]
+    fn test_anthropic_passthrough_claude_unchanged() {
+        // Regression: Claude models must not get reasoning_effort injected
+        let provider = create_provider(json!({}));
+        let body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "thinking": { "type": "enabled", "budget_tokens": 8000 },
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let result =
+            transform_claude_request_for_api_format(body, &provider, "anthropic", None, None)
+                .unwrap();
+        assert!(result.get("reasoning_effort").is_none());
+        assert!(result.get("enable_thinking").is_none());
+        // Original thinking field preserved
+        assert_eq!(result["thinking"]["type"], "enabled");
     }
 }

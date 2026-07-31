@@ -63,6 +63,21 @@ fn reasoning_explicitly_disabled(effort: Option<&str>) -> bool {
     )
 }
 
+/// qwen3.8-max series uses reasoning_effort param instead of Anthropic thinking format
+fn is_qwen_reasoning_effort_model(model: &str) -> bool {
+    model.to_lowercase().contains("qwen3.8-max")
+}
+
+/// Map Codex reasoning effort to qwen3.8-max accepted values (low / medium / xhigh)
+fn map_effort_to_qwen(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "disabled" => None,
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        _ => Some("xhigh"), // high, xhigh, max → xhigh
+    }
+}
+
 /// Preserve an Anthropic signed thinking/redacted-thinking block inside the opaque
 /// Responses `reasoning.encrypted_content` field so Codex replays it on the next
 /// tool-result request. The prefix keeps unrelated providers' ciphertext isolated.
@@ -296,10 +311,6 @@ pub fn responses_request_to_anthropic(
     let reasoning_effort = body
         .pointer("/reasoning/effort")
         .and_then(|value| value.as_str());
-    let adaptive_model = crate::proxy::thinking_optimizer::uses_adaptive_thinking(model);
-    let adaptive_by_default = crate::proxy::thinking_optimizer::adaptive_thinking_is_default(model);
-    let cannot_disable_thinking =
-        crate::proxy::thinking_optimizer::thinking_cannot_be_disabled(model);
 
     // max_output_tokens → max_tokens (required)
     let max_tokens = body
@@ -307,69 +318,94 @@ pub fn responses_request_to_anthropic(
         .and_then(|v| v.as_u64())
         .filter(|v| *v > 0)
         .unwrap_or(default_max_tokens);
-    let mut thinking_enabled = false;
-    let mut thinking_budget = reasoning_effort
-        .and_then(effort_to_thinking_budget)
-        .unwrap_or(0);
-    let explicitly_disabled = reasoning_explicitly_disabled(reasoning_effort);
-    let adaptive_should_think = adaptive_model
-        && (adaptive_by_default
-            || reasoning_effort
-                .and_then(codex_effort_to_anthropic)
-                .is_some());
-
-    if !thinking_history_is_valid {
-        if cannot_disable_thinking {
-            return Err(ProxyError::InvalidRequest(
-                "Anthropic model requires thinking, but the tool history has no signed thinking block to replay"
-                    .to_string(),
-            ));
-        }
-        if adaptive_should_think {
-            result["thinking"] = json!({ "type": "disabled" });
-        }
-    } else if adaptive_should_think && (!explicitly_disabled || cannot_disable_thinking) {
-        thinking_enabled = true;
-        result["thinking"] = json!({ "type": "adaptive" });
-        if let Some(effort) = reasoning_effort.and_then(codex_effort_to_anthropic) {
-            result["output_config"] = json!({ "effort": effort });
-        } else if explicitly_disabled && cannot_disable_thinking {
-            // Fable/Mythos cannot turn thinking off. `low` is the closest safe
-            // representation of Codex's explicit `none` request.
-            result["output_config"] = json!({ "effort": "low" });
-        }
-    } else if explicitly_disabled {
-        result["thinking"] = json!({ "type": "disabled" });
-    } else if thinking_budget > 0 {
-        thinking_enabled = true;
-        // Anthropic requires max_tokens > budget_tokens and budget >= 1024. Reserve
-        // headroom for the visible answer: cap the thinking budget at half of max_tokens
-        // so a large derived budget (e.g. 24576 for xhigh) can't consume nearly all of a
-        // modest max_tokens and leave ~1 output token (an effectively empty completion).
-        // Do not raise the caller's max_tokens (it may exceed the model's output ceiling
-        // and 400). If the remaining budget is below Anthropic's 1024 floor, disable
-        // thinking and restore normal sampling.
-        let ceiling = max_tokens / 2;
-        thinking_budget = thinking_budget.min(ceiling);
-        if thinking_budget < 1024 {
-            thinking_enabled = false;
-        }
-    }
     result["max_tokens"] = json!(max_tokens);
 
-    if thinking_enabled && !adaptive_model {
-        result["thinking"] = json!({
-            "type": "enabled",
-            "budget_tokens": thinking_budget
-        });
-    }
-
-    if !thinking_enabled {
+    // qwen3.8-max: use reasoning_effort param instead of Anthropic thinking format
+    let mut thinking_enabled = false;
+    let cannot_disable_thinking;
+    if is_qwen_reasoning_effort_model(model) {
+        cannot_disable_thinking = false;
+        if let Some(effort) = reasoning_effort {
+            if let Some(mapped) = map_effort_to_qwen(effort) {
+                result["reasoning_effort"] = json!(mapped);
+                result["enable_thinking"] = json!(true);
+            }
+        }
+        // Forward sampling params as-is (no thinking gate)
         if let Some(v) = body.get("temperature") {
             result["temperature"] = v.clone();
         }
         if let Some(v) = body.get("top_p") {
             result["top_p"] = v.clone();
+        }
+    } else {
+        let adaptive_model = crate::proxy::thinking_optimizer::uses_adaptive_thinking(model);
+        let adaptive_by_default =
+            crate::proxy::thinking_optimizer::adaptive_thinking_is_default(model);
+        cannot_disable_thinking =
+            crate::proxy::thinking_optimizer::thinking_cannot_be_disabled(model);
+        let mut thinking_budget = reasoning_effort
+            .and_then(effort_to_thinking_budget)
+            .unwrap_or(0);
+        let explicitly_disabled = reasoning_explicitly_disabled(reasoning_effort);
+        let adaptive_should_think = adaptive_model
+            && (adaptive_by_default
+                || reasoning_effort
+                    .and_then(codex_effort_to_anthropic)
+                    .is_some());
+
+        if !thinking_history_is_valid {
+            if cannot_disable_thinking {
+                return Err(ProxyError::InvalidRequest(
+                    "Anthropic model requires thinking, but the tool history has no signed thinking block to replay"
+                        .to_string(),
+                ));
+            }
+            if adaptive_should_think {
+                result["thinking"] = json!({ "type": "disabled" });
+            }
+        } else if adaptive_should_think && (!explicitly_disabled || cannot_disable_thinking) {
+            thinking_enabled = true;
+            result["thinking"] = json!({ "type": "adaptive" });
+            if let Some(effort) = reasoning_effort.and_then(codex_effort_to_anthropic) {
+                result["output_config"] = json!({ "effort": effort });
+            } else if explicitly_disabled && cannot_disable_thinking {
+                // Fable/Mythos cannot turn thinking off. `low` is the closest safe
+                // representation of Codex's explicit `none` request.
+                result["output_config"] = json!({ "effort": "low" });
+            }
+        } else if explicitly_disabled {
+            result["thinking"] = json!({ "type": "disabled" });
+        } else if thinking_budget > 0 {
+            thinking_enabled = true;
+            // Anthropic requires max_tokens > budget_tokens and budget >= 1024. Reserve
+            // headroom for the visible answer: cap the thinking budget at half of max_tokens
+            // so a large derived budget (e.g. 24576 for xhigh) can't consume nearly all of a
+            // modest max_tokens and leave ~1 output token (an effectively empty completion).
+            // Do not raise the caller's max_tokens (it may exceed the model's output ceiling
+            // and 400). If the remaining budget is below Anthropic's 1024 floor, disable
+            // thinking and restore normal sampling.
+            let ceiling = max_tokens / 2;
+            thinking_budget = thinking_budget.min(ceiling);
+            if thinking_budget < 1024 {
+                thinking_enabled = false;
+            }
+        }
+
+        if thinking_enabled && !adaptive_model {
+            result["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": thinking_budget
+            });
+        }
+
+        if !thinking_enabled {
+            if let Some(v) = body.get("temperature") {
+                result["temperature"] = v.clone();
+            }
+            if let Some(v) = body.get("top_p") {
+                result["top_p"] = v.clone();
+            }
         }
     }
 
@@ -2134,6 +2170,97 @@ mod tests {
         assert!(result.get("thinking").is_none());
         assert_eq!(result["temperature"], 0.7);
         assert_eq!(result["top_p"], 0.9);
+    }
+
+    // ==================== qwen3.8-max reasoning_effort ====================
+
+    #[test]
+    fn test_qwen_reasoning_effort_injected() {
+        let input = json!({
+            "model": "qwen3.8-max-preview",
+            "max_output_tokens": 4096,
+            "reasoning": { "effort": "high" },
+            "input": [{ "role": "user", "content": "hi" }]
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        // high → xhigh for qwen3.8-max
+        assert_eq!(result["reasoning_effort"], "xhigh");
+        assert_eq!(result["enable_thinking"], true);
+        // Must NOT produce Anthropic thinking format
+        assert!(result.get("thinking").is_none());
+        assert!(result.get("output_config").is_none());
+    }
+
+    #[test]
+    fn test_qwen_reasoning_effort_low() {
+        let input = json!({
+            "model": "qwen3.8-max-preview",
+            "max_output_tokens": 4096,
+            "reasoning": { "effort": "low" },
+            "input": [{ "role": "user", "content": "hi" }]
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(result["reasoning_effort"], "low");
+        assert_eq!(result["enable_thinking"], true);
+        assert!(result.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_qwen_reasoning_effort_medium() {
+        let input = json!({
+            "model": "qwen3.8-max",
+            "max_output_tokens": 4096,
+            "reasoning": { "effort": "medium" },
+            "input": [{ "role": "user", "content": "hi" }]
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(result["reasoning_effort"], "medium");
+        assert_eq!(result["enable_thinking"], true);
+    }
+
+    #[test]
+    fn test_qwen_reasoning_effort_disabled() {
+        let input = json!({
+            "model": "qwen3.8-max-preview",
+            "max_output_tokens": 4096,
+            "reasoning": { "effort": "none" },
+            "input": [{ "role": "user", "content": "hi" }]
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert!(result.get("reasoning_effort").is_none());
+        assert!(result.get("enable_thinking").is_none());
+        assert!(result.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_qwen_forwards_sampling_params() {
+        let input = json!({
+            "model": "qwen3.8-max-preview",
+            "max_output_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "reasoning": { "effort": "high" },
+            "input": [{ "role": "user", "content": "hi" }]
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(result["temperature"], 0.7);
+        assert_eq!(result["top_p"], 0.9);
+    }
+
+    #[test]
+    fn test_non_qwen_still_uses_thinking() {
+        // Regression: Claude models must still use Anthropic thinking format
+        let input = json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_output_tokens": 40000,
+            "reasoning": { "effort": "high" },
+            "input": [{ "role": "user", "content": "hi" }]
+        });
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(result["thinking"]["type"], "enabled");
+        assert_eq!(result["thinking"]["budget_tokens"], 16384);
+        assert!(result.get("reasoning_effort").is_none());
+        assert!(result.get("enable_thinking").is_none());
     }
 
     #[test]
