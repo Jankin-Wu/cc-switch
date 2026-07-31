@@ -434,6 +434,18 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
+    // qwen3.8-max series supports reasoning_effort (low / medium / xhigh)
+    if model.contains("qwen3.8-max") {
+        return Some(CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("enable_thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("qwen".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        });
+    }
+
     if haystack.contains("qwen") || haystack.contains("dashscope") || haystack.contains("bailian") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),

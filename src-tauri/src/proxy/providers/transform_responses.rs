@@ -347,6 +347,7 @@ pub fn anthropic_to_responses(
     if let Some(model_name) = body.get("model").and_then(|m| m.as_str()) {
         if super::transform::supports_reasoning_effort(model_name) {
             if let Some(effort) = super::transform::resolve_reasoning_effort(&body) {
+                let effort = super::transform::clamp_reasoning_effort_for_model(model_name, effort);
                 result["reasoning"] = json!({ "effort": effort });
             }
         }

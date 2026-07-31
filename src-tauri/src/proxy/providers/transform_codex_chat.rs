@@ -482,6 +482,12 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "minimal" => Some("minimal"),
             _ => None,
         },
+        // qwen3.8-max series: low / medium / xhigh (no "high")
+        "qwen" => match effort.as_str() {
+            "minimal" | "low" => Some("low"),
+            "medium" => Some("medium"),
+            _ => Some("xhigh"), // high, xhigh, max → xhigh
+        },
         _ => match effort.as_str() {
             "minimal" => Some("minimal"),
             "low" => Some("low"),

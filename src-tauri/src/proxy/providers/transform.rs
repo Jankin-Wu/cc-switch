@@ -78,6 +78,7 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
         || normalized == "grok-4.5"
         || normalized.starts_with("grok-4.5-")
         || normalized.starts_with("grok-build-")
+        || normalized.starts_with("qwen3.8-max")
 }
 
 /// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
@@ -121,6 +122,20 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
         }
         _ => None, // disabled or missing
     }
+}
+
+/// Clamp reasoning effort to the subset accepted by the target model.
+/// qwen3.8-max series only accepts low / medium / xhigh (no "high").
+pub fn clamp_reasoning_effort_for_model(model: &str, effort: &'static str) -> &'static str {
+    let normalized = model.to_lowercase();
+    if normalized.starts_with("qwen3.8-max") {
+        return match effort {
+            "low" => "low",
+            "medium" => "medium",
+            _ => "xhigh", // high, xhigh, max → xhigh
+        };
+    }
+    effort
 }
 
 /// Anthropic 请求 → OpenAI Chat Completions 请求
@@ -208,6 +223,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
     // Map Anthropic thinking → OpenAI reasoning_effort
     if supports_reasoning_effort(model) {
         if let Some(effort) = resolve_reasoning_effort(&body) {
+            let effort = clamp_reasoning_effort_for_model(model, effort);
             result["reasoning_effort"] = json!(effort);
         }
     }
@@ -1752,6 +1768,33 @@ mod tests {
         assert!(supports_reasoning_effort("grok-build-0.1"));
         assert!(!supports_reasoning_effort("gpt-4o"));
         assert!(!supports_reasoning_effort("claude-sonnet-4-6"));
+        assert!(supports_reasoning_effort("qwen3.8-max-preview"));
+        assert!(supports_reasoning_effort("qwen3.8-max"));
+        assert!(!supports_reasoning_effort("qwen3-coder-plus"));
+    }
+
+    #[test]
+    fn test_clamp_reasoning_effort_for_model() {
+        // qwen3.8-max: high → xhigh, low/medium preserved
+        assert_eq!(
+            clamp_reasoning_effort_for_model("qwen3.8-max-preview", "high"),
+            "xhigh"
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("qwen3.8-max-preview", "low"),
+            "low"
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("qwen3.8-max-preview", "medium"),
+            "medium"
+        );
+        assert_eq!(
+            clamp_reasoning_effort_for_model("qwen3.8-max", "xhigh"),
+            "xhigh"
+        );
+        // non-qwen models: passthrough
+        assert_eq!(clamp_reasoning_effort_for_model("gpt-5", "high"), "high");
+        assert_eq!(clamp_reasoning_effort_for_model("o3", "medium"), "medium");
     }
 
     // ── resolve_reasoning_effort unit tests ──
