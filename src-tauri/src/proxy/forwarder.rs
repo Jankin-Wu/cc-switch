@@ -881,7 +881,13 @@ impl RequestForwarder {
                                 });
                             }
 
-                            let budget_rectified = rectify_thinking_budget(&mut provider_body);
+                            // 火山方舟 Ark 网关对 max_tokens 硬上限 32768；命中后
+                            // 把整流器的 max_tokens ceiling 钳到 32768，避免重试时
+                            // 仍带 64000 触发上游 400。
+                            let (is_volcengine, max_tokens_ceiling) =
+                                crate::proxy::providers::volcengine_max_tokens_ceiling(provider);
+                            let budget_rectified =
+                                rectify_thinking_budget(&mut provider_body, max_tokens_ceiling);
                             if !budget_rectified.applied {
                                 log::warn!(
                                     "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
@@ -913,6 +919,11 @@ impl RequestForwarder {
                                 budget_rectified.before,
                                 budget_rectified.after
                             );
+                            if is_volcengine {
+                                log::info!(
+                                    "[{app_type_str}] [Volcengine] max_tokens ceiling={max_tokens_ceiling} applied (Ark 网关不接受 64000)"
+                                );
+                            }
 
                             let _ = std::mem::replace(&mut budget_rectifier_retried, true);
 

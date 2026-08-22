@@ -27,6 +27,17 @@ const ANTHROPIC_REDACTED_THINKING_PLACEHOLDER: &str = "[redacted thinking]";
 // disrupt the model's chain of thought. Do not re-add without re-confirming.
 const REASONING_VENDOR_HINTS: &[&str] = &["deepseek", "mimo", "xiaomimimo"];
 
+/// Volcengine Ark 的 Anthropic 兼容网关对单次请求的 `max_tokens` 硬上限为 32768；
+/// 超过即 400 `expected a value <= 32768`。cc-switch 的 thinking budget 整流器
+/// 默认会把 `max_tokens` 抬到 64000 以保证 `budget_tokens=32000` 的 headroom，
+/// 火山方舟不接受 64000，需要按 base_url 命中后强制把 ceiling 钳到 32768。
+///
+/// Hint 列表小写匹配；与 `REASONING_VENDOR_HINTS` 的匹配方式完全一致。
+const VOLCENGINE_BASE_URL_HINTS: &[&str] = &["volces.com", "volcengine"];
+
+/// Volcengine Ark 网关允许的最大 `max_tokens` 值（与官方文档一致）。
+pub const VOLCENGINE_MAX_TOKENS_CEILING: u64 = 32768;
+
 // ChatGPT Codex 后端按 originator+version 组合做模型 cohort 路由：非官方身份会把
 // gpt-5.6-luna 解析到未部署的内部引擎（HTTP 404 Model not found，openai/codex#31967，
 // 本机 A/B 实测确认）。两个头必须成对发送，缺一即 404；version 需 ≥ 目标模型
@@ -108,6 +119,56 @@ fn is_reasoning_vendor_identifier(value: &str) -> bool {
     REASONING_VENDOR_HINTS
         .iter()
         .any(|hint| value.contains(hint))
+}
+
+/// 按 settings_config 中的优先级顺序提取供应商的 Anthropic 兼容 base_url：
+/// `env.ANTHROPIC_BASE_URL` → `base_url` → `baseURL` → `apiEndpoint`。
+///
+/// 路径顺序与同文件 `should_normalize_anthropic_tool_thinking_history`
+/// （L131-138）保持一致；返回 None 表示供应商未配置任何 base_url。
+pub fn extract_any_anthropic_base_url(provider: &Provider) -> Option<String> {
+    let settings = &provider.settings_config;
+    let urls = [
+        settings
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str()),
+        settings.get("base_url").and_then(|v| v.as_str()),
+        settings.get("baseURL").and_then(|v| v.as_str()),
+        settings.get("apiEndpoint").and_then(|v| v.as_str()),
+    ];
+    urls.into_iter()
+        .flatten()
+        .map(|s| s.trim_end_matches('/').to_string())
+        .find(|s| !s.is_empty())
+}
+
+/// 判断供应商是否指向火山引擎 Ark（Anthropic 兼容网关）。命中后 caller 需要
+/// 把 `max_tokens` 钳到 [`VOLCENGINE_MAX_TOKENS_CEILING`]，避免服务端 400。
+///
+/// 仅按 `base_url` 字符串匹配，不依赖 model 名称；用户自定义中转转发到火山方舟
+/// 时 base_url 是中转域名（不会被命中）——这是预期行为，因为网关在中转时
+/// `max_tokens` 上限由中转决定，不由本 helper 介入。
+pub fn is_volcengine_anthropic_endpoint(provider: &Provider) -> bool {
+    extract_any_anthropic_base_url(provider)
+        .map(|url| {
+            let lower = url.to_ascii_lowercase();
+            VOLCENGINE_BASE_URL_HINTS.iter().any(|h| lower.contains(h))
+        })
+        .unwrap_or(false)
+}
+
+/// 返回 `(is_volcengine, max_tokens_ceiling)`：
+/// 命中火山方舟 → `(true, 32768)`；否则 → `(false, u64::MAX)`。
+///
+/// 整流器调用方拿到 ceiling 后用 `MAX_TOKENS_VALUE.min(ceiling)` 即可
+/// 正确处理两种分支，无需在调用点重复火山方舟识别逻辑。
+pub fn volcengine_max_tokens_ceiling(provider: &Provider) -> (bool, u64) {
+    if is_volcengine_anthropic_endpoint(provider) {
+        (true, VOLCENGINE_MAX_TOKENS_CEILING)
+    } else {
+        (false, u64::MAX)
+    }
 }
 
 fn should_normalize_anthropic_tool_thinking_history(
@@ -2756,5 +2817,58 @@ mod tests {
         assert!(changed);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("output_config").is_none());
+    }
+
+    // ==================== Volcengine Ark max_tokens ceiling 识别 ====================
+
+    #[test]
+    fn test_is_volcengine_endpoint_matches_ark_domain() {
+        let provider = create_provider(json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3" }
+        }));
+        assert!(is_volcengine_anthropic_endpoint(&provider));
+        assert_eq!(
+            volcengine_max_tokens_ceiling(&provider),
+            (true, VOLCENGINE_MAX_TOKENS_CEILING)
+        );
+    }
+
+    #[test]
+    fn test_is_volcengine_endpoint_matches_top_level_base_url() {
+        let provider = create_provider(json!({
+            "base_url": "https://ark.volcengine.com/api/v3"
+        }));
+        assert!(is_volcengine_anthropic_endpoint(&provider));
+    }
+
+    #[test]
+    fn test_is_volcengine_endpoint_matches_baseurl_and_apiendpoint_alias() {
+        for key in ["baseURL", "apiEndpoint"] {
+            let provider = create_provider(json!({
+                key: "https://open.volcengineapi.com/ark"
+            }));
+            assert!(
+                is_volcengine_anthropic_endpoint(&provider),
+                "should match key={key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_volcengine_endpoint_rejects_other_providers() {
+        let provider = create_provider(json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://api.anthropic.com" }
+        }));
+        assert!(!is_volcengine_anthropic_endpoint(&provider));
+        assert_eq!(volcengine_max_tokens_ceiling(&provider), (false, u64::MAX));
+    }
+
+    #[test]
+    fn test_is_volcengine_endpoint_rejects_transit_proxy_domain() {
+        // 自定义中转转发到火山方舟时 base_url 是中转域名，不应误识别。
+        let provider = create_provider(json!({
+            "base_url": "https://my-relay.example.com/anthropic"
+        }));
+        assert!(!is_volcengine_anthropic_endpoint(&provider));
     }
 }

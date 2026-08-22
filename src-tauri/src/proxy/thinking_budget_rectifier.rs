@@ -76,9 +76,13 @@ pub fn should_rectify_thinking_budget(
 ///
 /// 整流动作：
 /// - `thinking.type = "enabled"`
-/// - `thinking.budget_tokens = 32000`
-/// - 如果 `max_tokens < 32001`，设为 `64000`
-pub fn rectify_thinking_budget(body: &mut Value) -> BudgetRectifyResult {
+/// - `thinking.budget_tokens = min(32000, max_tokens_ceiling - 1)`（≥1024 兜底）
+/// - 如果 `max_tokens < 32001`，设为 `min(64000, max_tokens_ceiling)`
+///
+/// `max_tokens_ceiling` 由调用方按供应商传入：
+/// - 火山引擎 Ark 等受限网关传 `32768`（或更紧的 2048 等）
+/// - 官方 Anthropic / 中转服务传 `u64::MAX`（与旧实现行为完全一致）
+pub fn rectify_thinking_budget(body: &mut Value, max_tokens_ceiling: u64) -> BudgetRectifyResult {
     let before = snapshot_budget(body);
 
     // 与 CCH 对齐：adaptive 请求不改写
@@ -103,14 +107,26 @@ pub fn rectify_thinking_budget(body: &mut Value) -> BudgetRectifyResult {
         };
     };
 
+    // 在受限 ceiling 下 max_tokens 会被钳小，budget_tokens 必须严格 < max_tokens
+    // （Anthropic 400 on `budget_tokens >= max_tokens`）。target_max_tokens
+    // 必须先确定再算 budget，否则会出现 budget=32000 但 max_tokens=2048 的非法态。
+    let target_max_tokens = MAX_TOKENS_VALUE.min(max_tokens_ceiling);
+    let clamped_budget = if target_max_tokens > 1 {
+        MAX_THINKING_BUDGET
+            .min(target_max_tokens.saturating_sub(1))
+            .max(1024)
+    } else {
+        1024
+    };
+
     thinking.insert("type".to_string(), Value::String("enabled".to_string()));
     thinking.insert(
         "budget_tokens".to_string(),
-        Value::Number(MAX_THINKING_BUDGET.into()),
+        Value::Number(clamped_budget.into()),
     );
 
     if before.max_tokens.is_none() || before.max_tokens < Some(MIN_MAX_TOKENS_FOR_BUDGET) {
-        body["max_tokens"] = Value::Number(MAX_TOKENS_VALUE.into());
+        body["max_tokens"] = Value::Number(target_max_tokens.into());
     }
 
     let after = snapshot_budget(body);
@@ -242,7 +258,7 @@ mod tests {
             "max_tokens": 1024
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(result.applied);
         assert_eq!(result.before.thinking_type.as_deref(), Some("enabled"));
@@ -267,7 +283,7 @@ mod tests {
             "max_tokens": 1024
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(!result.applied);
         assert_eq!(result.before, result.after);
@@ -284,7 +300,7 @@ mod tests {
             "max_tokens": 100000
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(result.applied);
         assert_eq!(result.before.max_tokens, Some(100000));
@@ -299,7 +315,7 @@ mod tests {
             "max_tokens": 1024
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(result.applied);
         assert_eq!(result.before.thinking_type, None);
@@ -321,7 +337,7 @@ mod tests {
             "thinking": { "type": "enabled", "budget_tokens": 512 }
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(result.applied);
         assert_eq!(result.before.max_tokens, None);
@@ -337,7 +353,7 @@ mod tests {
             "max_tokens": 1024
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(result.applied);
         assert_eq!(result.before.thinking_type.as_deref(), Some("disabled"));
@@ -355,11 +371,59 @@ mod tests {
             "max_tokens": 64001
         });
 
-        let result = rectify_thinking_budget(&mut body);
+        let result = rectify_thinking_budget(&mut body, u64::MAX);
 
         assert!(!result.applied);
         assert_eq!(result.before, result.after);
         assert_eq!(body["thinking"]["budget_tokens"], 32000);
         assert_eq!(body["max_tokens"], 64001);
+    }
+
+    // ==================== ceiling 钳制测试（Volcengine Ark 等受限网关） ====================
+
+    #[test]
+    fn test_rectify_budget_caps_max_tokens_at_volcengine_ceiling() {
+        // 模拟火山方舟网关：ceiling=32768。客户端发 max_tokens=1024，整流器
+        // 不再把 max_tokens 抬到 64000，而是钳到 32768；budget_tokens=32000
+        // 仍然 < 32768（满足 Anthropic 不变量 budget < max_tokens）。
+        let mut body = json!({
+            "model": "claude-test",
+            "thinking": { "type": "enabled", "budget_tokens": 512 },
+            "max_tokens": 1024
+        });
+
+        let result = rectify_thinking_budget(&mut body, 32768);
+
+        assert!(result.applied);
+        assert_eq!(result.after.max_tokens, Some(32768));
+        assert_eq!(body["max_tokens"], 32768);
+        // 32000 < 32768 严格小于，符合 Anthropic `budget_tokens < max_tokens` 约束
+        assert_eq!(body["thinking"]["budget_tokens"], 32000);
+        assert!(
+            body["thinking"]["budget_tokens"].as_u64().unwrap()
+                < body["max_tokens"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_rectify_budget_caps_thinking_budget_when_ceiling_smaller_than_default() {
+        // 极小 ceiling（未来其他受限网关可能）：ceiling=2048。max_tokens 钳到
+        // 2048，budget_tokens 必须严格 < 2048，且 ≥ 1024（Anthropic 下限）。
+        let mut body = json!({
+            "model": "claude-test",
+            "thinking": { "type": "enabled", "budget_tokens": 512 },
+            "max_tokens": 1024
+        });
+
+        let result = rectify_thinking_budget(&mut body, 2048);
+
+        assert!(result.applied);
+        assert_eq!(body["max_tokens"], 2048);
+        // budget 兜底：min(32000, 2048-1)=2047 与 max(1024) 取 = 2047
+        // （2047 < 2048 严格小于约束）
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert_eq!(budget, 2047);
+        assert!(budget < body["max_tokens"].as_u64().unwrap());
+        assert!(budget >= 1024);
     }
 }
